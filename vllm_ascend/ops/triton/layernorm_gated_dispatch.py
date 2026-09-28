@@ -2,8 +2,8 @@
 
 The selector deliberately knows nothing about torch, devices, or resource
 queries.  The wrapper supplies the initialized vector-core count on NPU and
-``None`` for non-NPU tensors. Wide-N NPU choices also require a qualified
-compile-target UB size; unknown resource capacity never implies eligibility.
+``None`` for non-NPU tensors. Wide-N NPU choices use the initialized UB size
+and the measured resource envelope.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ class LaunchSpec(NamedTuple):
 
 
 class C2Config(NamedTuple):
-    """N-chunk launch shape and minimum qualified compiler-target UB bytes."""
+    """N-chunk launch shape and minimum tested UB budget in bytes."""
 
     block_m: int
     block_n_chunk: int
@@ -51,7 +51,7 @@ class DispatchParams:
     k_c2_num: int | None = None
     k_c2_den: int | None = None
     c2_config: C2Config | None = None
-    # (power-of-two BLOCK_N, minimum qualified compiler-target UB bytes).
+    # (power-of-two BLOCK_N, minimum tested UB budget in bytes).
     full_tile_ub_envelope: tuple[tuple[int, int], ...] = ()
 
 
@@ -134,7 +134,7 @@ def _select_layernorm_launch(
     """Select a qualified full-tile or N-chunk path.
 
     Non-NPU calls retain the upstream BASE64 launch. NPU calls supply the
-    worker-initialized vector-core count and compiler-target UB capacity.
+    worker-initialized vector-core count and UB budget.
     """
     validate_params(params)
     _validate_inputs(M, N_group, ngroups, runtime_p, ub_bytes)
@@ -153,7 +153,7 @@ def _select_layernorm_launch(
             base_tiles = _ceil_div(M, BM_LARGE_N_BASE) * ngroups
             if base_tiles * _need(params.k_c2_den, "k_c2_den") < _need(params.k_c2_num, "k_c2_num") * runtime_p:
                 return LaunchSpec("FT_BASE", BM_LARGE_N_BASE)
-        if c2_safe:
+        if c2_safe and c2 is not None:
             return LaunchSpec("C2_BASE", c2.block_m, c2.block_n_chunk)
         raise DispatchConfigError("no resource-qualified LayerNorm-Gated path")
 

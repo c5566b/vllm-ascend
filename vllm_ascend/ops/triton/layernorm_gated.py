@@ -9,6 +9,14 @@
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.ops.triton.layernorm_gated_dispatch import (
+    C2Config,
+    DispatchConfigError,
+    DispatchParams,
+    _select_layernorm_launch,
+)
+from vllm_ascend.ops.triton.triton_utils import get_ub_size_bytes, get_vectorcore_num
+
 _C2_SIGNED_I32_MAX = 2**31 - 1
 
 
@@ -484,22 +492,12 @@ def layer_norm_fwd_npu(
     mean = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device) if not is_rms_norm else None
     rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
 
-    from vllm_ascend.ops.triton.layernorm_gated_dispatch import (
-        DispatchConfigError,
-        _select_layernorm_launch,
-    )
-
     runtime_p = None
     ub_bytes = None
     if getattr(getattr(x, "device", None), "type", None) == "npu":
-        from vllm_ascend.ops.triton.triton_utils import (
-            get_vectorcore_num,
-            try_get_compile_target_ub_bytes,
-        )
-
         runtime_p = get_vectorcore_num()
         if group_size > 128:
-            ub_bytes = try_get_compile_target_ub_bytes()
+            ub_bytes = get_ub_size_bytes()
     spec = _select_layernorm_launch(
         M,
         group_size,
@@ -631,9 +629,7 @@ def layer_norm_fwd_npu(
 
 
 def _layer_norm_gated_experimental_params():
-    from vllm_ascend.ops.triton.layernorm_gated_dispatch import C2Config, DispatchParams
-
-    # 196608 bytes = the qualified 192 KiB compile-target UB bucket.
+    # 196608 bytes = the 192 KiB UB budget tested on A2/Ascend910B3.
     return DispatchParams(
         bm_small=16,
         bm_multi=32,

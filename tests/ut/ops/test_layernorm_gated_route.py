@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 LAYER_NORM = ROOT / "vllm_ascend" / "ops" / "triton" / "layernorm_gated.py"
@@ -60,17 +61,17 @@ class _FakeKernel:
 
 def _load_layernorm_with_fakes():
     """Load the public wrapper with only stdlib fake torch/Triton modules."""
-    launches = []
-    state = {
+    launches: list[tuple[Any, ...]] = []
+    state: dict[str, Any] = {
         "device_name": "UnknownAscendModel",
         "vector_cores": 40,
         "name_calls": 0,
         "getter_calls": 0,
-        "compile_target_ub": 196608,
+        "ub_size": 196608,
         "ub_getter_calls": 0,
     }
 
-    fake_torch = types.ModuleType("torch")
+    fake_torch: Any = types.ModuleType("torch")
     fake_torch.float16 = "float16"
     fake_torch.bfloat16 = "bfloat16"
     fake_torch.float32 = "float32"
@@ -89,9 +90,10 @@ def _load_layernorm_with_fakes():
     fake_torch.empty_like = lambda x: _FakeTensor(x.shape, x.dtype, x.device.type, x.device.index)
     fake_torch.empty = lambda shape, dtype, device: _FakeTensor(shape, dtype, device.type, device.index)
 
-    fake_vllm = types.ModuleType("vllm")
-    fake_vllm_triton = types.ModuleType("vllm.triton_utils")
-    fake_vllm_triton.tl = types.SimpleNamespace(float32="float32")
+    fake_vllm: Any = types.ModuleType("vllm")
+    fake_vllm_triton: Any = types.ModuleType("vllm.triton_utils")
+    # Python 3.12 evaluates the kernel's tl.constexpr annotations at import time.
+    fake_vllm_triton.tl = types.SimpleNamespace(float32="float32", constexpr=object)
 
     class _Triton:
         @staticmethod
@@ -113,13 +115,13 @@ def _load_layernorm_with_fakes():
     fake_vllm_triton.triton = _Triton
     fake_vllm.triton_utils = fake_vllm_triton
 
-    fake_ascend = types.ModuleType("vllm_ascend")
+    fake_ascend: Any = types.ModuleType("vllm_ascend")
     fake_ascend.__path__ = []
-    fake_ops = types.ModuleType("vllm_ascend.ops")
+    fake_ops: Any = types.ModuleType("vllm_ascend.ops")
     fake_ops.__path__ = []
-    fake_triton_pkg = types.ModuleType("vllm_ascend.ops.triton")
+    fake_triton_pkg: Any = types.ModuleType("vllm_ascend.ops.triton")
     fake_triton_pkg.__path__ = []
-    fake_utils = types.ModuleType("vllm_ascend.ops.triton.triton_utils")
+    fake_utils: Any = types.ModuleType("vllm_ascend.ops.triton.triton_utils")
 
     def get_vectorcore_num():
         state["getter_calls"] += 1
@@ -128,20 +130,22 @@ def _load_layernorm_with_fakes():
 
     fake_utils.get_vectorcore_num = get_vectorcore_num
 
-    def try_get_compile_target_ub_bytes():
+    def get_ub_size_bytes():
         state["ub_getter_calls"] += 1
-        return state["compile_target_ub"]
+        return state["ub_size"]
 
-    fake_utils.try_get_compile_target_ub_bytes = try_get_compile_target_ub_bytes
+    fake_utils.get_ub_size_bytes = get_ub_size_bytes
     fake_triton_pkg.triton_utils = fake_utils
     fake_ops.triton = fake_triton_pkg
     fake_ascend.ops = fake_ops
 
     dispatch_name = "vllm_ascend.ops.triton.layernorm_gated_dispatch"
     dispatch_spec = importlib.util.spec_from_file_location(dispatch_name, DISPATCH)
+    assert dispatch_spec is not None and dispatch_spec.loader is not None
     dispatch = importlib.util.module_from_spec(dispatch_spec)
     layer_name = "vllm_ascend.ops.triton.layernorm_gated"
     layer_spec = importlib.util.spec_from_file_location(layer_name, LAYER_NORM)
+    assert layer_spec is not None and layer_spec.loader is not None
     layer = importlib.util.module_from_spec(layer_spec)
     saved = {
         name: sys.modules.get(name)
@@ -318,12 +322,12 @@ class WrapperRouteTests(unittest.TestCase):
             self.assertEqual((kwargs["HAS_BIAS"], kwargs["HAS_Z"]), (False, True))
             self.assertIsNone(args[3])
 
-            state["compile_target_ub"] = None
+            state["ub_size"] = 131072
             before_launches = len(launches)
             with self.assertRaisesRegex(ValueError, "no resource-qualified"):
                 call(65, columns=256)
             self.assertEqual(len(launches), before_launches)
-            state["compile_target_ub"] = 196608
+            state["ub_size"] = 196608
 
             with self.assertRaisesRegex(RuntimeError, "C2 M exceeds signed i32"):
                 call(2**31, columns=192)

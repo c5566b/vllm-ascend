@@ -43,8 +43,6 @@ depthwise_seperable_CNN = "depthwise_seperable_CNN"
 
 [default.extend-words]
 mata = "mata"
-tbe = "tbe" # Ascend Tensor Boost Engine module/capability name.
-TBE = "TBE"
 iy = "iy"
 tendencias = "tendencias"
 PARD = "PARD"

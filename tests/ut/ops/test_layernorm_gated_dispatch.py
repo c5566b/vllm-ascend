@@ -5,6 +5,7 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, ClassVar
 
 ROOT = Path(__file__).resolve().parents[3]
 PATH = ROOT / "vllm_ascend" / "ops" / "triton" / "layernorm_gated_dispatch.py"
@@ -13,6 +14,7 @@ PATH = ROOT / "vllm_ascend" / "ops" / "triton" / "layernorm_gated_dispatch.py"
 def load_selector():
     name = "pr1_layernorm_dispatch"
     spec = importlib.util.spec_from_file_location(name, PATH)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     previous = sys.modules.get(name)
     sys.modules[name] = module
@@ -27,6 +29,9 @@ def load_selector():
 
 
 class SelectorTests(unittest.TestCase):
+    mod: ClassVar[Any]
+    params: ClassVar[Any]
+
     @classmethod
     def setUpClass(cls):
         cls.mod = load_selector()

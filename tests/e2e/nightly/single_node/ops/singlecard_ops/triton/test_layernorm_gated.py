@@ -5,9 +5,9 @@ import torch.nn.functional as F
 import vllm_ascend.ops.triton.layernorm_gated as layernorm_gated
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.ops.triton.triton_utils import (
+    get_ub_size_bytes,
     get_vectorcore_num,
     init_device_properties_triton,
-    try_get_compile_target_ub_bytes,
 )
 
 DEVICE = "npu"
@@ -233,8 +233,8 @@ def test_layer_norm_fwd_npu_persistent_routes(
 )
 @torch.inference_mode()
 def test_layer_norm_fwd_npu_c2_public_route(group_size, has_bias, has_gate, is_rms_norm, monkeypatch):
-    if (try_get_compile_target_ub_bytes() or 0) < 196608:
-        pytest.skip("C2 BM64/BNc64 needs a qualified 192 KiB compile target")
+    if get_ub_size_bytes() < 196608:
+        pytest.skip("C2 BM64/BNc64 needs a 192 KiB UB budget")
 
     # First M with ceil(M/16) == 4P, the measured FT16 -> C2 boundary.
     rows = (4 * get_vectorcore_num() - 1) * 16 + 1
