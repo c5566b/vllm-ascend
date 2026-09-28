@@ -8,6 +8,8 @@ from vllm_ascend import envs
 _NUM_AICORE = -1
 _NUM_VECTORCORE = -1
 _UB_SIZE_BYTES = -1
+_COMPILE_TARGET_UB_BYTES: int | None = None
+_COMPILE_TARGET_UB_QUERIED = False
 _extension_module = None
 
 # Safe default for Ascend 910B (A2) and 910C (A3), both have 192 KB UB.
@@ -70,6 +72,7 @@ else:
 
 def init_device_properties_triton():
     global _NUM_AICORE, _NUM_VECTORCORE, _UB_SIZE_BYTES
+    global _COMPILE_TARGET_UB_BYTES, _COMPILE_TARGET_UB_QUERIED
     if _NUM_AICORE == -1 and HAS_TRITON:
         device_properties: dict[str, Any] = triton.runtime.driver.active.utils.get_device_properties(
             torch.npu.current_device()
@@ -96,6 +99,24 @@ def init_device_properties_triton():
         if env_override > 0:
             _UB_SIZE_BYTES = env_override * 1024
 
+    # C2 resource qualification uses the compiler's selected SoC, not the
+    # runtime UB cache above (which may contain a compatibility fallback).
+    # A missing TBE capability remains unknown and is never promoted to a
+    # qualified full-tile or N-chunk resource bucket.
+    if HAS_TRITON and _NUM_VECTORCORE > 0 and not _COMPILE_TARGET_UB_QUERIED:
+        try:
+            device_index = torch.npu.current_device()
+            soc = torch.npu.get_device_name(device_index)
+            from tbe.common.platform import get_soc_spec, set_current_compile_soc_info
+
+            set_current_compile_soc_info(soc)
+            ub_size = get_soc_spec("UB_SIZE")
+            if type(ub_size) is int and ub_size > 0:
+                _COMPILE_TARGET_UB_BYTES = ub_size
+        except Exception:
+            _COMPILE_TARGET_UB_BYTES = None
+        _COMPILE_TARGET_UB_QUERIED = True
+
 
 def get_aicore_num():
     global _NUM_AICORE
@@ -107,6 +128,14 @@ def get_vectorcore_num():
     global _NUM_VECTORCORE
     assert _NUM_VECTORCORE > 0, "Device properties not initialized. Please call init_device_properties_triton() first."
     return _NUM_VECTORCORE
+
+
+def try_get_compile_target_ub_bytes() -> int | None:
+    """Return the cached compile-target UB size, or None when unavailable.
+
+    This read never queries the device or substitutes the runtime UB fallback.
+    """
+    return _COMPILE_TARGET_UB_BYTES
 
 
 def get_ub_size_bytes():

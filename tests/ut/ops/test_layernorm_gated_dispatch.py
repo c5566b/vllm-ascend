@@ -3,6 +3,7 @@
 import importlib.util
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -57,7 +58,7 @@ class SelectorTests(unittest.TestCase):
         for rows, spec in expected.items():
             self.assertEqual(m._select_layernorm_launch(rows, 128, 1, 40, self.params), spec)
 
-    def test_multi_group_and_wide_n_are_base_fallbacks(self):
+    def test_multi_group_and_non_npu_are_base_fallbacks(self):
         m = self.mod
         self.assertEqual(
             m._select_layernorm_launch(2048, 128, 2, 40, self.params),
@@ -68,9 +69,49 @@ class SelectorTests(unittest.TestCase):
             m.LaunchSpec("FT_BASE", 16),
         )
         self.assertEqual(
-            m._select_layernorm_launch(2048, 256, 1, 40, self.params),
+            m._select_layernorm_launch(2048, 256, 1, None, self.params),
             m.LaunchSpec("FT_BASE", 64),
         )
+
+    def test_wide_n_qualified_resource_and_k_c2_boundary(self):
+        m = self.mod
+        params = replace(
+            self.params,
+            k_c2_num=4,
+            k_c2_den=1,
+            c2_config=m.C2Config(64, 64, 196608),
+            full_tile_ub_envelope=((256, 196608), (512, 196608)),
+        )
+        def select(rows, width, ub=196608):
+            return m._select_layernorm_launch(
+                rows, width, 1, 40, params, ub_bytes=ub
+            )
+        self.assertEqual(select(2544, 192), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(select(2545, 192), m.LaunchSpec("C2_BASE", 64, 64))
+        self.assertEqual(select(2545, 384), m.LaunchSpec("C2_BASE", 64, 64))
+        self.assertEqual(select(65, 1024), m.LaunchSpec("C2_BASE", 64, 64))
+        self.assertEqual(
+            m._select_layernorm_launch(2545, 192, 1, None, params),
+            m.LaunchSpec("FT_BASE", 64),
+        )
+        for ub in (None, 196607):
+            with self.assertRaisesRegex(m.DispatchConfigError, "no resource-qualified"):
+                select(2545, 192, ub)
+        ft_only = replace(params, c2_config=None)
+        self.assertEqual(
+            m._select_layernorm_launch(2545, 192, 1, 40, ft_only, ub_bytes=196608),
+            m.LaunchSpec("FT_BASE", 16),
+        )
+
+    def test_wide_n_rejects_malformed_resource_policy(self):
+        m = self.mod
+        for params in (
+            replace(self.params, full_tile_ub_envelope=((256, 196608), (256, 196608))),
+            replace(self.params, full_tile_ub_envelope=((257, 196608),)),
+            replace(self.params, c2_config=m.C2Config(64, 64, 0)),
+        ):
+            with self.assertRaises(m.DispatchConfigError):
+                m._select_layernorm_launch(65, 256, 1, 40, params, ub_bytes=196608)
 
     def test_invalid_policy_and_shape_fail_closed(self):
         m = self.mod
