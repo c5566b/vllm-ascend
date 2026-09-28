@@ -232,9 +232,7 @@ def test_layer_norm_fwd_npu_persistent_routes(
     ],
 )
 @torch.inference_mode()
-def test_layer_norm_fwd_npu_c2_public_route(
-    group_size, has_bias, has_gate, is_rms_norm, monkeypatch
-):
+def test_layer_norm_fwd_npu_c2_public_route(group_size, has_bias, has_gate, is_rms_norm, monkeypatch):
     if (try_get_compile_target_ub_bytes() or 0) < 196608:
         pytest.skip("C2 BM64/BNc64 needs a qualified 192 KiB compile target")
 
@@ -248,14 +246,17 @@ def test_layer_norm_fwd_npu_c2_public_route(
     generator = torch.Generator(device="cpu").manual_seed(42)
     x = torch.randn(shape, generator=generator, dtype=torch.bfloat16).to(DEVICE)
     weight = torch.randn((group_size,), generator=generator, dtype=torch.bfloat16).to(DEVICE)
-    bias = (
-        torch.randn((group_size,), generator=generator, dtype=torch.bfloat16).to(DEVICE)
-        if has_bias else None
-    )
+    bias = torch.randn((group_size,), generator=generator, dtype=torch.bfloat16).to(DEVICE) if has_bias else None
     z = torch.randn(shape, generator=generator, dtype=torch.bfloat16).to(DEVICE) if has_gate else None
     actual, actual_mean, actual_rstd = layer_norm_fwd_npu(
-        x, weight, bias, 1e-6, z=z, group_size=group_size,
-        norm_before_gate=False, is_rms_norm=is_rms_norm,
+        x,
+        weight,
+        bias,
+        1e-6,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=False,
+        is_rms_norm=is_rms_norm,
     )
     expected, expected_mean, expected_rstd = layer_norm_gated_ref(
         x, weight, bias, 1e-6, z, group_size, False, is_rms_norm

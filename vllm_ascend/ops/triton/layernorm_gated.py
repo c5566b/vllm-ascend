@@ -12,9 +12,7 @@ from vllm.triton_utils import tl, triton
 _C2_SIGNED_I32_MAX = 2**31 - 1
 
 
-def _check_c2_launch_bounds(
-    M, N_total, group_size, ngroups, block_m, block_n_chunk
-):
+def _check_c2_launch_bounds(M, N_total, group_size, ngroups, block_m, block_n_chunk):
     """Prove the public C2 launch stays inside the lowering's i32 domains.
 
     The C2 kernel intentionally retains i32 loop/count values.  This guard is
@@ -35,61 +33,40 @@ def _check_c2_launch_bounds(
     if M > _C2_SIGNED_I32_MAX:
         raise RuntimeError(f"layer_norm_fwd_npu: C2 M exceeds signed i32: {M}")
     if N_total > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 N_total exceeds signed i32: {N_total}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 N_total exceeds signed i32: {N_total}")
     if ngroups > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 ngroups exceeds signed i32: {ngroups}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 ngroups exceeds signed i32: {ngroups}")
     if block_m > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 BLOCK_M exceeds signed i32: {block_m}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 BLOCK_M exceeds signed i32: {block_m}")
     if block_n_chunk > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 BLOCK_N_CHUNK exceeds signed i32: {block_n_chunk}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 BLOCK_N_CHUNK exceeds signed i32: {block_n_chunk}")
 
     feature_offset_domain = group_size * ngroups
     if feature_offset_domain > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 feature offset exceeds signed i32: {feature_offset_domain}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 feature offset exceeds signed i32: {feature_offset_domain}")
 
     stats_offset = ngroups * M
     if stats_offset > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 stats offset exceeds signed i32: {stats_offset}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 stats offset exceeds signed i32: {stats_offset}")
 
     num_m_tiles = (M + block_m - 1) // block_m
     max_row_index = (num_m_tiles - 1) * block_m + (block_m - 1)
     if max_row_index > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 row/tile index exceeds signed i32: {max_row_index}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 row/tile index exceeds signed i32: {max_row_index}")
 
     max_group_offset = (ngroups - 1) * group_size + (group_size - 1)
     if max_group_offset > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            f"layer_norm_fwd_npu: C2 group feature offset exceeds signed i32: {max_group_offset}"
-        )
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 group feature offset exceeds signed i32: {max_group_offset}")
 
     if group_size > _C2_SIGNED_I32_MAX - (block_n_chunk - 1):
-        raise RuntimeError(
-            "layer_norm_fwd_npu: C2 group_size exceeds the i32 chunk/count bound"
-        )
+        raise RuntimeError("layer_norm_fwd_npu: C2 group_size exceeds the i32 chunk/count bound")
     last_chunk_start = ((group_size - 1) // block_n_chunk) * block_n_chunk
     final_chunk_update = last_chunk_start + block_n_chunk
     if final_chunk_update > _C2_SIGNED_I32_MAX:
-        raise RuntimeError(
-            "layer_norm_fwd_npu: C2 chunk-loop update exceeds signed i32"
-        )
+        raise RuntimeError("layer_norm_fwd_npu: C2 chunk-loop update exceeds signed i32")
     count_upper_bound = group_size
     if count_upper_bound > _C2_SIGNED_I32_MAX:
         raise RuntimeError("layer_norm_fwd_npu: C2 count exceeds signed i32")
-
 
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -356,13 +333,28 @@ def _layer_norm_fwd_persistent_hoist_kernel_npu(
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
 @triton.jit(
     do_not_specialize=[
-        "stride_x_row", "stride_y_row", "stride_z_row", "M", "N", "eps",
+        "stride_x_row",
+        "stride_y_row",
+        "stride_z_row",
+        "M",
+        "N",
+        "eps",
     ]
 )
 def _layer_norm_fwd_c2_nchunk_kernel_npu(
-    X, Y, W, B, Z, Mean, Rstd,
-    stride_x_row, stride_y_row, stride_z_row,
-    M, N, eps,
+    X,
+    Y,
+    W,
+    B,
+    Z,
+    Mean,
+    Rstd,
+    stride_x_row,
+    stride_y_row,
+    stride_z_row,
+    M,
+    N,
+    eps,
     BLOCK_M: tl.constexpr,
     BLOCK_N_CHUNK: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -406,24 +398,16 @@ def _layer_norm_fwd_c2_nchunk_kernel_npu(
 
         valid_count = tl.minimum(N - chunk_start, BLOCK_N_CHUNK)
         if IS_RMS_NORM:
-            sumsq += tl.sum(
-                tl.where(col_mask[None, :], x_chunk * x_chunk, 0.0), axis=1
-            )
+            sumsq += tl.sum(tl.where(col_mask[None, :], x_chunk * x_chunk, 0.0), axis=1)
         else:
             valid_count_f = valid_count.to(tl.float32)
-            chunk_mean = tl.sum(
-                tl.where(col_mask[None, :], x_chunk, 0.0), axis=1
-            ) / valid_count_f
-            centered = tl.where(
-                col_mask[None, :], x_chunk - chunk_mean[:, None], 0.0
-            )
+            chunk_mean = tl.sum(tl.where(col_mask[None, :], x_chunk, 0.0), axis=1) / valid_count_f
+            centered = tl.where(col_mask[None, :], x_chunk - chunk_mean[:, None], 0.0)
             chunk_m2 = tl.sum(centered * centered, axis=1)
             total_count = acc_count + valid_count
             total_count_f = total_count.to(tl.float32)
             delta = chunk_mean - acc_mean
-            acc_m2 += chunk_m2 + delta * delta * (
-                acc_count.to(tl.float32) * valid_count_f / total_count_f
-            )
+            acc_m2 += chunk_m2 + delta * delta * (acc_count.to(tl.float32) * valid_count_f / total_count_f)
             acc_mean += delta * (valid_count_f / total_count_f)
             acc_count = total_count
 
@@ -560,9 +544,7 @@ def layer_norm_fwd_npu(
     if spec.impl == "C2_BASE":
         if spec.block_n_chunk is None:
             raise DispatchConfigError("C2_BASE spec missing block_n_chunk")
-        _check_c2_launch_bounds(
-            M, N, group_size, ngroups, spec.block_m, spec.block_n_chunk
-        )
+        _check_c2_launch_bounds(M, N, group_size, ngroups, spec.block_m, spec.block_n_chunk)
         grid = (triton.cdiv(M, spec.block_m), ngroups)
         _layer_norm_fwd_c2_nchunk_kernel_npu[grid](
             x,

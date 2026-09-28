@@ -6,11 +6,7 @@ import types
 import unittest
 from pathlib import Path
 
-
-UTILS = (
-    Path(__file__).resolve().parents[3]
-    / "vllm_ascend/ops/triton/triton_utils.py"
-)
+UTILS = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/triton/triton_utils.py"
 
 
 def load_utils(ub_result):
@@ -24,16 +20,10 @@ def load_utils(ub_result):
     vllm = types.ModuleType("vllm")
     triton_utils = types.ModuleType("vllm.triton_utils")
     triton_utils.HAS_TRITON = True
-    triton_utils.tl = types.SimpleNamespace(
-        insert_slice=object(), extract_slice=object(), get_element=object()
-    )
-    driver_utils = types.SimpleNamespace(
-        get_device_properties=lambda _index: {"num_aicore": 20, "num_vectorcore": 40}
-    )
+    triton_utils.tl = types.SimpleNamespace(insert_slice=object(), extract_slice=object(), get_element=object())
+    driver_utils = types.SimpleNamespace(get_device_properties=lambda _index: {"num_aicore": 20, "num_vectorcore": 40})
     triton_utils.triton = types.SimpleNamespace(
-        runtime=types.SimpleNamespace(
-            driver=types.SimpleNamespace(active=types.SimpleNamespace(utils=driver_utils))
-        )
+        runtime=types.SimpleNamespace(driver=types.SimpleNamespace(active=types.SimpleNamespace(utils=driver_utils)))
     )
     vllm.triton_utils = triton_utils
 

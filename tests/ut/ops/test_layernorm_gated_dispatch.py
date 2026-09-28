@@ -82,10 +82,10 @@ class SelectorTests(unittest.TestCase):
             c2_config=m.C2Config(64, 64, 196608),
             full_tile_ub_envelope=((256, 196608), (512, 196608)),
         )
+
         def select(rows, width, ub=196608):
-            return m._select_layernorm_launch(
-                rows, width, 1, 40, params, ub_bytes=ub
-            )
+            return m._select_layernorm_launch(rows, width, 1, 40, params, ub_bytes=ub)
+
         self.assertEqual(select(2544, 192), m.LaunchSpec("FT_BASE", 16))
         self.assertEqual(select(2545, 192), m.LaunchSpec("C2_BASE", 64, 64))
         self.assertEqual(select(2545, 384), m.LaunchSpec("C2_BASE", 64, 64))

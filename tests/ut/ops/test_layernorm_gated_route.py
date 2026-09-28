@@ -127,6 +127,7 @@ def _load_layernorm_with_fakes():
         return state["vector_cores"]
 
     fake_utils.get_vectorcore_num = get_vectorcore_num
+
     def try_get_compile_target_ub_bytes():
         state["ub_getter_calls"] += 1
         return state["compile_target_ub"]

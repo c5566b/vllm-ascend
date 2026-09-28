@@ -144,17 +144,9 @@ def _select_layernorm_launch(
     if N_group > 128:
         block_n = 1 << (N_group - 1).bit_length()
         required_ft_ub = dict(params.full_tile_ub_envelope).get(block_n)
-        ft_safe = (
-            ub_bytes is not None
-            and required_ft_ub is not None
-            and ub_bytes >= required_ft_ub
-        )
+        ft_safe = ub_bytes is not None and required_ft_ub is not None and ub_bytes >= required_ft_ub
         c2 = params.c2_config
-        c2_safe = (
-            ub_bytes is not None
-            and c2 is not None
-            and ub_bytes >= c2.minimum_qualified_ub_bytes
-        )
+        c2_safe = ub_bytes is not None and c2 is not None and ub_bytes >= c2.minimum_qualified_ub_bytes
         if ft_safe and not c2_safe:
             return LaunchSpec("FT_BASE", BM_LARGE_N_BASE)
         if ft_safe:
