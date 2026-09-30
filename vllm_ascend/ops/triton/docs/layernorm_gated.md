@@ -42,7 +42,7 @@
 - **Differences**:
     - NPU execution can use a smaller BASE row tile or a capped persistent M-axis grid instead of always launching one BASE64 program per row tile.
     - HOIST32 moves single-group weight and optional bias loads outside each program's M-tile loop. This describes source-level work placement, not an isolated measured speedup claim.
-    - Wide `N_group` can use FT16 or the two-pass C2 kernel under an explicit resource envelope. The measured `K_c2=4` crossover affects performance selection only when both are feasible; it cannot override a resource rejection.
+    - Wide `N_group` can use FT16 or the two-pass C2 kernel under an explicit resource envelope. Paired FT16/C2 measurements selected `K_c2=4` as the smallest tested workload ratio with gains at both measured widths. This threshold affects performance selection only when both paths are feasible; it cannot override a resource rejection.
 
 ## Test Cases
 
@@ -58,4 +58,4 @@
   pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_layernorm_gated.py
   ```
 
-- Three BF16 cases from PR1 derive M from the initialized vector-core count to exercise PERSIST32 and HOIST32. Two further BF16 cases exercise the public C2 route at the first `ceil(M/16)=4P` tile for `N_group=192,384`, compare `out`, `mean`, and `rstd` with the CPU reference, and verify the actual JIT grid. An A2/B3 offline single-operator run has checked representative numerics and routes for this implementation; these in-tree cases still require execution on a matching-main NPU environment.
+- Three BF16 cases from PR1 derive M from the initialized vector-core count to exercise PERSIST32 and HOIST32. Two further BF16 cases exercise the public C2 route at the first `ceil(M/16)=4P` tile for `N_group=192,384`, compare `out`, `mean`, and `rstd` with the CPU reference, and verify the actual JIT grid. An A2/B3 offline single-operator run checked representative numerics and routes at an earlier PR2 runtime checkpoint, before the switch to the existing UB getter. The current source and these in-tree cases still require execution on a matching-main NPU environment.
