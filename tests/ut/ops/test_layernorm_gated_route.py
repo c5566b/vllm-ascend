@@ -14,15 +14,14 @@ DISPATCH = ROOT / "vllm_ascend" / "ops" / "triton" / "layernorm_gated_dispatch.p
 
 
 class RouteSourceTests(unittest.TestCase):
-    def test_sources_parse_and_exclude_wide_path_symbols(self):
+    def test_sources_parse_and_include_bounded_c2_path(self):
         layer_source = LAYER_NORM.read_text()
         dispatch_source = DISPATCH.read_text()
         ast.parse(layer_source)
         ast.parse(dispatch_source)
-        self.assertNotIn("c2_", layer_source.lower())
-        self.assertNotIn("c2_", dispatch_source.lower())
-        self.assertNotIn("compile_target", layer_source.lower())
-        self.assertNotIn("try_get_compile_target", layer_source)
+        self.assertIn("_layer_norm_fwd_c2_nchunk_kernel_npu", layer_source)
+        self.assertIn("_check_c2_launch_bounds", layer_source)
+        self.assertIn("no resource-qualified LayerNorm-Gated path", dispatch_source)
 
     def test_device_name_and_dtype_allowlists_are_absent(self):
         source = LAYER_NORM.read_text()
@@ -68,6 +67,8 @@ def _load_layernorm_with_fakes():
         "vector_cores": 40,
         "name_calls": 0,
         "getter_calls": 0,
+        "ub_size": 196608,
+        "ub_getter_calls": 0,
     }
 
     fake_torch: Any = types.ModuleType("torch")
@@ -128,6 +129,12 @@ def _load_layernorm_with_fakes():
         return state["vector_cores"]
 
     fake_utils.get_vectorcore_num = get_vectorcore_num
+
+    def get_ub_size_bytes():
+        state["ub_getter_calls"] += 1
+        return state["ub_size"]
+
+    fake_utils.get_ub_size_bytes = get_ub_size_bytes
     fake_triton_pkg.triton_utils = fake_utils
     fake_ops.triton = fake_triton_pkg
     fake_ascend.ops = fake_ops
@@ -301,7 +308,30 @@ class WrapperRouteTests(unittest.TestCase):
             self.assertEqual(state["name_calls"], before_name_calls)
 
             call(64, columns=256)
-            self.assertEqual(launches[-1][3]["BLOCK_M"], 64)
+            self.assertEqual(launches[-1][3]["BLOCK_M"], 16)
+            self.assertEqual(state["ub_getter_calls"], 1)
+
+            call(2544, columns=192)
+            self.assertEqual(launches[-1][0], "_layer_norm_fwd_1pass_kernel_npu")
+            self.assertEqual(launches[-1][3]["BLOCK_M"], 16)
+            call(2545, columns=192, bias=False, z=True, is_rms_norm=True)
+            name, grid, args, kwargs = launches[-1]
+            self.assertEqual(name, "_layer_norm_fwd_c2_nchunk_kernel_npu")
+            self.assertEqual(grid, (40, 1))
+            self.assertEqual((kwargs["BLOCK_M"], kwargs["BLOCK_N_CHUNK"]), (64, 64))
+            self.assertEqual((kwargs["HAS_BIAS"], kwargs["HAS_Z"]), (False, True))
+            self.assertIsNone(args[3])
+
+            state["ub_size"] = 131072
+            before_launches = len(launches)
+            with self.assertRaisesRegex(ValueError, "no resource-qualified"):
+                call(65, columns=256)
+            self.assertEqual(len(launches), before_launches)
+            state["ub_size"] = 196608
+
+            with self.assertRaisesRegex(RuntimeError, "C2 M exceeds signed i32"):
+                call(2**31, columns=192)
+            self.assertEqual(len(launches), before_launches)
 
             state["vector_cores"] = None
             with self.assertRaisesRegex(AssertionError, "Device properties not initialized"):

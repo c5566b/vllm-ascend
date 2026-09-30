@@ -4,7 +4,11 @@ import torch.nn.functional as F
 
 import vllm_ascend.ops.triton.layernorm_gated as layernorm_gated
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+from vllm_ascend.ops.triton.triton_utils import (
+    get_ub_size_bytes,
+    get_vectorcore_num,
+    init_device_properties_triton,
+)
 
 DEVICE = "npu"
 TOLERANCES = {
@@ -218,6 +222,54 @@ def test_layer_norm_fwd_npu_persistent_routes(
     torch.testing.assert_close(actual_rstd.cpu(), expected_rstd, rtol=rtol, atol=atol)
     assert actual_mean is None
     assert expected_mean is None
+
+
+@pytest.mark.parametrize(
+    ("group_size", "has_bias", "has_gate", "is_rms_norm"),
+    [
+        pytest.param(192, False, True, True, id="c2-rmsnorm-pre-gate-n192"),
+        pytest.param(384, True, False, False, id="c2-layernorm-bias-n384"),
+    ],
+)
+@torch.inference_mode()
+def test_layer_norm_fwd_npu_c2_public_route(group_size, has_bias, has_gate, is_rms_norm, monkeypatch):
+    if get_ub_size_bytes() < 196608:
+        pytest.skip("C2 BM64/BNc64 needs a 192 KiB UB budget")
+
+    # First M with ceil(M/16) == 4P, the measured FT16 -> C2 boundary.
+    rows = (4 * get_vectorcore_num() - 1) * 16 + 1
+    shape = (rows, group_size)
+    original_kernel = layernorm_gated._layer_norm_fwd_c2_nchunk_kernel_npu
+    recorder = _KernelLaunchRecorder(original_kernel)
+    monkeypatch.setattr(layernorm_gated, "_layer_norm_fwd_c2_nchunk_kernel_npu", recorder)
+
+    generator = torch.Generator(device="cpu").manual_seed(42)
+    x = torch.randn(shape, generator=generator, dtype=torch.bfloat16).to(DEVICE)
+    weight = torch.randn((group_size,), generator=generator, dtype=torch.bfloat16).to(DEVICE)
+    bias = torch.randn((group_size,), generator=generator, dtype=torch.bfloat16).to(DEVICE) if has_bias else None
+    z = torch.randn(shape, generator=generator, dtype=torch.bfloat16).to(DEVICE) if has_gate else None
+    actual, actual_mean, actual_rstd = layer_norm_fwd_npu(
+        x,
+        weight,
+        bias,
+        1e-6,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=False,
+        is_rms_norm=is_rms_norm,
+    )
+    expected, expected_mean, expected_rstd = layer_norm_gated_ref(
+        x, weight, bias, 1e-6, z, group_size, False, is_rms_norm
+    )
+
+    assert recorder.grids == [((rows + 63) // 64, 1)]
+    rtol, atol = TOLERANCES[torch.bfloat16]
+    torch.testing.assert_close(actual.float().cpu(), expected.float(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_rstd.cpu(), expected_rstd, rtol=rtol, atol=atol)
+    if is_rms_norm:
+        assert actual_mean is None
+    else:
+        torch.testing.assert_close(actual_mean.cpu(), expected_mean, rtol=rtol, atol=atol)
 
 
 @torch.inference_mode()
