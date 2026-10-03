@@ -29,6 +29,7 @@ class RouteSourceTests(unittest.TestCase):
         self.assertNotIn("_is_pr1_dtype", source)
         self.assertNotIn("try_get_vectorcore_num", source)
         self.assertIn("get_vectorcore_num", source)
+        self.assertIn("get_ub_size_bytes", source)
         self.assertNotIn("qualified=qualified", source)
 
 
@@ -242,32 +243,52 @@ class WrapperRouteTests(unittest.TestCase):
             self.assertIs(returned[1], args[5])
             self.assertIs(returned[2], args[6])
 
-            call(289)
+            call(288)
             name, grid, args, kwargs = launches[-1]
-            self.assertEqual(name, "_layer_norm_fwd_persistent_kernel_npu")
-            self.assertEqual(grid, (10,))
-            self.assertEqual(len(args), 15)
-            self.assertEqual((args[13], args[14]), (10, 1))
-            self.assertEqual((kwargs["BLOCK_M"], kwargs["BLOCK_N"]), (32, 128))
-            self.assertEqual(launches[-1][3]["NORM_BEFORE_GATE"], True)
-            self.assertEqual(launches[-1][3]["IS_RMS_NORM"], False)
+            self.assertEqual(name, "_layer_norm_fwd_1pass_kernel_npu")
+            self.assertEqual(grid, (18, 1))
+            self.assertEqual(len(args), 13)
+            self.assertEqual((kwargs["BLOCK_M"], kwargs["BLOCK_N"]), (16, 128))
+            self.assertEqual(kwargs["NORM_BEFORE_GATE"], True)
+            self.assertEqual(kwargs["IS_RMS_NORM"], False)
 
             rms_result = call(
-                289,
+                288,
                 bias=False,
                 z=True,
                 norm_before_gate=False,
                 is_rms_norm=True,
             )
             name, grid, args, kwargs = launches[-1]
-            self.assertEqual(name, "_layer_norm_fwd_persistent_kernel_npu")
+            self.assertEqual(name, "_layer_norm_fwd_1pass_kernel_npu")
             self.assertIsNone(args[3])
             self.assertIsNotNone(args[4])
             self.assertIsNone(rms_result[1])
-            self.assertEqual(rms_result[2].shape, (289,))
+            self.assertEqual(rms_result[2].shape, (288,))
             self.assertIs(rms_result[2], args[6])
             self.assertEqual(kwargs["NORM_BEFORE_GATE"], False)
             self.assertEqual(kwargs["IS_RMS_NORM"], True)
+
+            call(639)
+            self.assertEqual(launches[-1][0], "_layer_norm_fwd_persistent_hoist_kernel_npu")
+            self.assertEqual(launches[-1][1], (20,))
+            self.assertEqual(launches[-1][3]["BLOCK_M"], 32)
+
+            call(289)
+            name, grid, args, kwargs = launches[-1]
+            self.assertEqual(name, "_layer_norm_fwd_persistent_hoist_kernel_npu")
+            self.assertEqual(grid, (10,))
+            self.assertEqual(len(args), 14)
+            self.assertEqual(args[13], 10)
+            self.assertEqual(kwargs["BLOCK_M"], 32)
+
+            call(640)
+            name, grid, args, kwargs = launches[-1]
+            self.assertEqual(name, "_layer_norm_fwd_persistent_hoist_kernel_npu")
+            self.assertEqual(grid, (20,))
+            self.assertEqual(len(args), 14)
+            self.assertEqual(args[13], 20)
+            self.assertEqual(kwargs["BLOCK_M"], 32)
 
             call(20449)
             name, grid, args, kwargs = launches[-1]
@@ -309,33 +330,89 @@ class WrapperRouteTests(unittest.TestCase):
 
             call(64, columns=256)
             self.assertEqual(launches[-1][3]["BLOCK_M"], 16)
+            self.assertEqual(launches[-1][3]["BLOCK_N"], 256)
             self.assertEqual(state["ub_getter_calls"], 1)
 
-            call(2544, columns=192)
-            self.assertEqual(launches[-1][0], "_layer_norm_fwd_1pass_kernel_npu")
+            for group_size, block_n in (
+                (129, 256),
+                (192, 256),
+                (256, 256),
+                (257, 512),
+                (384, 512),
+                (512, 512),
+            ):
+                call(65, columns=group_size)
+                name, grid, args, kwargs = launches[-1]
+                self.assertEqual(name, "_layer_norm_fwd_1pass_kernel_npu")
+                self.assertEqual((grid, args[10], args[11]), ((5, 1), 65, group_size))
+                self.assertEqual(kwargs["BLOCK_M"], 16)
+                self.assertEqual(kwargs["BLOCK_N"], block_n)
+
+            # Routing uses per-group width, not the total tensor width.
+            before_ub_calls = state["ub_getter_calls"]
+            call(65, columns=384, group_size=128)
+            self.assertEqual(launches[-1][1], (3, 3))
+            self.assertEqual(launches[-1][2][11], 128)
+            self.assertEqual(launches[-1][3]["BLOCK_M"], 32)
+            self.assertEqual(launches[-1][3]["BLOCK_N"], 128)
+            self.assertEqual(state["ub_getter_calls"], before_ub_calls)
+
+            call(65, columns=384, group_size=192)
+            self.assertEqual(launches[-1][1], (5, 2))
+            self.assertEqual(launches[-1][2][11], 192)
             self.assertEqual(launches[-1][3]["BLOCK_M"], 16)
-            call(2545, columns=192, bias=False, z=True, is_rms_norm=True)
+            self.assertEqual(launches[-1][3]["BLOCK_N"], 256)
+            self.assertEqual(state["ub_getter_calls"], before_ub_calls + 1)
+
+            for ub_size in (196607, None):
+                state["ub_size"] = ub_size
+                call(65, columns=192)
+                self.assertEqual(launches[-1][3]["BLOCK_M"], 64)
+                self.assertEqual(launches[-1][3]["BLOCK_N"], 256)
+
+            state["ub_size"] = 196608
+            before_ub_calls = state["ub_getter_calls"]
+            call(65, columns=513, bias=False, z=True, is_rms_norm=True)
             name, grid, args, kwargs = launches[-1]
             self.assertEqual(name, "_layer_norm_fwd_c2_nchunk_kernel_npu")
-            self.assertEqual(grid, (40, 1))
+            self.assertEqual(grid, (2, 1))
             self.assertEqual((kwargs["BLOCK_M"], kwargs["BLOCK_N_CHUNK"]), (64, 64))
             self.assertEqual((kwargs["HAS_BIAS"], kwargs["HAS_Z"]), (False, True))
             self.assertIsNone(args[3])
+            self.assertEqual(state["ub_getter_calls"], before_ub_calls + 1)
 
-            state["ub_size"] = 131072
+            call(65, columns=1026, group_size=513)
+            self.assertEqual(launches[-1][1], (2, 2))
+            self.assertEqual(launches[-1][3]["BLOCK_N_CHUNK"], 64)
+
             before_launches = len(launches)
-            with self.assertRaisesRegex(ValueError, "no resource-qualified"):
-                call(65, columns=256)
-            self.assertEqual(len(launches), before_launches)
+            for ub_size in (None, 131072):
+                state["ub_size"] = ub_size
+                with self.subTest(ub_size=ub_size), self.assertRaisesRegex(ValueError, "no resource-qualified"):
+                    call(65, columns=513)
+                self.assertEqual(len(launches), before_launches)
             state["ub_size"] = 196608
 
             with self.assertRaisesRegex(RuntimeError, "C2 M exceeds signed i32"):
-                call(2**31, columns=192)
+                call(2**31, columns=513)
             self.assertEqual(len(launches), before_launches)
+
+            before_ub_calls = state["ub_getter_calls"]
+            state["vector_cores"] = None
+            with self.assertRaisesRegex(AssertionError, "Device properties not initialized"):
+                call(65, columns=256)
+            self.assertEqual(state["ub_getter_calls"], before_ub_calls)
+            state["vector_cores"] = 40
+
+            before_ub_calls = state["ub_getter_calls"]
+            call(65, columns=256, device_type="cpu")
+            self.assertEqual(launches[-1][3]["BLOCK_M"], 64)
+            self.assertEqual(launches[-1][3]["BLOCK_N"], 256)
+            self.assertEqual(state["ub_getter_calls"], before_ub_calls)
 
             state["vector_cores"] = None
             with self.assertRaisesRegex(AssertionError, "Device properties not initialized"):
-                call(289)
+                call(288)
 
             for device_type in ("cpu", "cuda"):
                 before_getter_calls = state["getter_calls"]

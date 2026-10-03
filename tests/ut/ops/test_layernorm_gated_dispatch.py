@@ -3,7 +3,6 @@
 import importlib.util
 import sys
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -30,114 +29,107 @@ def load_selector():
 
 class SelectorTests(unittest.TestCase):
     mod: ClassVar[Any]
-    params: ClassVar[Any]
 
     @classmethod
     def setUpClass(cls):
         cls.mod = load_selector()
-        cls.params = cls.mod.DispatchParams(
-            bm_small=16,
-            bm_multi=32,
-            k_persist_num=1,
-            k_persist_den=4,
-            n_persist_min=128,
-            hoist_qualified=True,
-            persist_single_qualified=True,
-        )
 
     def test_unknown_p_keeps_base64(self):
+        self.assertEqual(
+            self.mod._select_layernorm_launch(20449, 128, 1, None),
+            self.mod.LaunchSpec("FT_BASE", 64),
+        )
+
+    def test_single_group_uses_integer_quarter_wave_boundary(self):
         m = self.mod
-        self.assertEqual(
-            m._select_layernorm_launch(20449, 128, 1, None, self.params),
-            m.LaunchSpec("FT_BASE", 64),
-        )
+        for rows in (128, 288):
+            with self.subTest(rows=rows):
+                self.assertEqual(
+                    m._select_layernorm_launch(rows, 128, 1, 40),
+                    m.LaunchSpec("FT_BASE", 16),
+                )
+        for rows in (289, 290, 639, 640, 641, 20449, 65536):
+            with self.subTest(rows=rows):
+                self.assertEqual(
+                    m._select_layernorm_launch(rows, 128, 1, 40),
+                    m.LaunchSpec("FT_PERSIST_HOIST", 32),
+                )
 
-    def test_a2_calibrated_boundaries_are_formula_based(self):
+    def test_boundary_scales_with_runtime_vector_core_count(self):
         m = self.mod
-        expected = {
-            288: m.LaunchSpec("FT_BASE", 16),
-            289: m.LaunchSpec("FT_PERSIST", 32),
-            20448: m.LaunchSpec("FT_PERSIST", 32),
-            20449: m.LaunchSpec("FT_PERSIST_HOIST", 32),
-        }
-        for rows, spec in expected.items():
-            self.assertEqual(m._select_layernorm_launch(rows, 128, 1, 40, self.params), spec)
-
-    def test_multi_group_and_non_npu_are_base_fallbacks(self):
-        m = self.mod
-        self.assertEqual(
-            m._select_layernorm_launch(2048, 128, 2, 40, self.params),
-            m.LaunchSpec("FT_BASE", 32),
-        )
-        self.assertEqual(
-            m._select_layernorm_launch(2048, 127, 2, 40, self.params),
-            m.LaunchSpec("FT_BASE", 16),
-        )
-        self.assertEqual(
-            m._select_layernorm_launch(2048, 256, 1, None, self.params),
-            m.LaunchSpec("FT_BASE", 64),
-        )
-
-    def test_wide_n_qualified_resource_and_k_c2_boundary(self):
-        m = self.mod
-        params = replace(
-            self.params,
-            k_c2_num=4,
-            k_c2_den=1,
-            c2_config=m.C2Config(64, 64, 196608),
-            full_tile_ub_envelope=((256, 196608), (512, 196608)),
-        )
-
-        def select(rows, width, ub=196608):
-            return m._select_layernorm_launch(rows, width, 1, 40, params, ub_bytes=ub)
-
-        self.assertEqual(select(2544, 192), m.LaunchSpec("FT_BASE", 16))
-        self.assertEqual(select(2545, 192), m.LaunchSpec("C2_BASE", 64, 64))
-        self.assertEqual(select(2545, 384), m.LaunchSpec("C2_BASE", 64, 64))
-        self.assertEqual(select(65, 1024), m.LaunchSpec("C2_BASE", 64, 64))
-        self.assertEqual(
-            m._select_layernorm_launch(2545, 192, 1, None, params),
-            m.LaunchSpec("FT_BASE", 64),
-        )
-        for ub in (None, 196607):
-            with self.assertRaisesRegex(m.DispatchConfigError, "no resource-qualified"):
-                select(2545, 192, ub)
-        ft_only = replace(params, c2_config=None)
-        self.assertEqual(
-            m._select_layernorm_launch(2545, 192, 1, 40, ft_only, ub_bytes=196608),
-            m.LaunchSpec("FT_BASE", 16),
-        )
-
-    def test_wide_n_rejects_malformed_resource_policy(self):
-        m = self.mod
-        for params in (
-            replace(self.params, full_tile_ub_envelope=((256, 196608), (256, 196608))),
-            replace(self.params, full_tile_ub_envelope=((257, 196608),)),
-            replace(self.params, c2_config=m.C2Config(64, 64, 0)),
+        for rows, expected in (
+            (352, m.LaunchSpec("FT_BASE", 16)),
+            (353, m.LaunchSpec("FT_PERSIST_HOIST", 32)),
+            (354, m.LaunchSpec("FT_PERSIST_HOIST", 32)),
         ):
-            with self.assertRaises(m.DispatchConfigError):
-                m._select_layernorm_launch(65, 256, 1, 40, params, ub_bytes=196608)
+            with self.subTest(rows=rows):
+                self.assertEqual(m._select_layernorm_launch(rows, 128, 1, 48), expected)
 
-    def test_invalid_policy_and_shape_fail_closed(self):
+    def test_quarter_wave_boundary_uses_exact_integer_tiles(self):
+        m = self.mod
+        for runtime_p in (1, 3, 7, 39, 41):
+            tiles_needed = (runtime_p + 3) // 4
+            boundary = (tiles_needed - 1) * m.BM_HOIST + 1
+            with self.subTest(runtime_p=runtime_p):
+                self.assertEqual(
+                    m._select_layernorm_launch(boundary, 128, 1, runtime_p),
+                    m.LaunchSpec("FT_PERSIST_HOIST", 32),
+                )
+                if boundary > 1:
+                    self.assertEqual(
+                        m._select_layernorm_launch(boundary - 1, 128, 1, runtime_p),
+                        m.LaunchSpec("FT_BASE", 16),
+                    )
+
+    def test_small_group_multi_group_and_wide_n_routes(self):
+        m = self.mod
+        self.assertEqual(m._select_layernorm_launch(2048, 128, 2, 40), m.LaunchSpec("FT_BASE", 32))
+        self.assertEqual(m._select_layernorm_launch(2048, 127, 2, 40), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(m._select_layernorm_launch(2048, 129, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(m._select_layernorm_launch(2048, 192, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(m._select_layernorm_launch(2048, 256, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(m._select_layernorm_launch(2048, 384, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(m._select_layernorm_launch(2048, 512, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
+        self.assertEqual(
+            m._select_layernorm_launch(65, 513, 1, 40, ub_bytes=196608),
+            m.LaunchSpec("C2_BASE", 64, 64),
+        )
+        self.assertEqual(
+            m._select_layernorm_launch(65, 1024, 2, 40, ub_bytes=196608),
+            m.LaunchSpec("C2_BASE", 64, 64),
+        )
+
+    def test_ft16_requires_qualified_ub_and_initialized_p(self):
+        m = self.mod
+        for ub_bytes in (None, 196607):
+            with self.subTest(ub_bytes=ub_bytes):
+                self.assertEqual(
+                    m._select_layernorm_launch(65, 192, 1, 40, ub_bytes=ub_bytes),
+                    m.LaunchSpec("FT_BASE", 64),
+                )
+        self.assertEqual(
+            m._select_layernorm_launch(65, 192, 1, None, ub_bytes=196608),
+            m.LaunchSpec("FT_BASE", 64),
+        )
+
+    def test_invalid_shape_and_resource_inputs_fail_closed(self):
         m = self.mod
         with self.assertRaises(m.DispatchConfigError):
-            m._select_layernorm_launch(0, 128, 1, 40, self.params)
-        with self.assertRaises(m.DispatchConfigError):
-            m._select_layernorm_launch(
-                64,
-                32,
-                1,
-                40,
-                m.DispatchParams(
-                    bm_small=16,
-                    bm_multi=32,
-                    k_persist_num=1,
-                    k_persist_den=4,
-                    n_persist_min=128,
-                    hoist_qualified=True,
-                    persist_single_qualified=False,
-                ),
-            )
+            m._select_layernorm_launch(0, 128, 1, 40)
+        with self.assertRaisesRegex(m.DispatchConfigError, "ub_bytes"):
+            m._select_layernorm_launch(65, 192, 1, 40, ub_bytes=0)
+        with self.assertRaisesRegex(m.DispatchConfigError, "runtime_p"):
+            m._select_layernorm_launch(65, 128, 1, 0)
+        for ub_bytes in (None, 196607):
+            with (
+                self.subTest(ub_bytes=ub_bytes),
+                self.assertRaisesRegex(m.DispatchConfigError, "no resource-qualified"),
+            ):
+                m._select_layernorm_launch(65, 513, 1, 40, ub_bytes=ub_bytes)
+        self.assertEqual(
+            m._select_layernorm_launch(65, 513, 1, None),
+            m.LaunchSpec("FT_BASE", 64),
+        )
 
 
 if __name__ == "__main__":
