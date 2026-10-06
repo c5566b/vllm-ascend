@@ -36,6 +36,8 @@
 - The BASE feature-width guard alone does not qualify every resource bucket. The 192 KiB UB evidence covers only its recorded B3 history and B4 regression cases; other resource buckets, devices, and dtypes are not inferred by interpolation. Getter defaults/debugging overrides are routing inputs, not independent measurements. Route selection depends on shape, group count, and initialized resource getters, not tensor values. Non-NPU calls retain BASE64; uninitialized NPU vector-core properties raise before selection.
 - Former q=4 C2 selection measurements are historical and do not quantify performance lost by this resource-only simplification. No performance claim is made for the new selector.
 
+- Final unforced public HOIST32 at B4/P40, N128, BF16 RMSNorm with gate before normalization (`norm_before_gate=False`), had median BASE16/candidate paired ratios of 1.033535 at M289 and 1.078332 at M639. Against the former PERSIST32 path the ratios were 0.998504 and 0.996091, with mixed directions. These controls describe simplification and the sampled selector boundary; BASE16 and PERSIST32 are not the frozen upstream BASE64 comparator, and the threshold is not an optimal crossover claim.
+
 ## Origin and Differences
 
 - **Origin**: The existing `layernorm_gated.py` implementation is adapted from Flash Linear Attention's gated LayerNorm and the Triton LayerNorm tutorial. PR1 reuses the original BASE kernel's normalization and gating math.
@@ -76,8 +78,26 @@ This is native single-operator evidence for the frozen three-case/two-seed matri
 
 ### Updated evidence for the inherited PR1 domain (2026-10-05)
 
-PR1 code `bdbdc07a9f268751bed01dff3a0b300b0005cb0f` now has separately accepted frozen-BASE64 comparisons at M128/288/289/639/20449, N128/G1/BF16 RMS+Z/no bias, `norm_before_gate=False`, eps1e-6, on Ascend910B4/P40 with initialized UB196608. Median six-pair BASE64/final ratios are1.470820x,1.153072x,1.161114x,1.059783x and1.271823x respectively. They quantify the parent PR1 dispatch for five points; none is a C2 timing or a PR2 speedup.
+The following measurements qualify parent PR1 routes only; they are not C2 timings or PR2 speedups. N192 stays on PR1 FT16. PR2's resource motivation remains its independently accepted N1024 FP16/False FT16-negative/public-C2-positive control above. No new PR2 device experiment accompanies this documentation and parent-ancestry update.
 
-At M60/N192/G1/BF16 RMS+Z/no bias, both True and False gate orders have two-seed same-input controls: four upstream BASE64 compiler UB negatives (numeric NOT_RUN) and four final PR1 FT16 numerical PASS, with independent health probes after each negative. These N192 controls establish bounded parent runability; N192 stays on PR1 FT16 rather than PR2 C2. No timing was collected for N192. PR2's resource motivation remains its independently accepted N1024 FP16/False FT16-negative/public-C2-positive control above; the new PR1 results do not prove all-wide C2 necessity.
+Seven native batches compare frozen upstream `5f8a1286a2d04d35b94ebc8a961057c48a7b82d2` with final PR1 `bdbdc07a9f268751bed01dff3a0b300b0005cb0f`, using complete unforced public wrappers on one Ascend910B4 logical device0 with initialized P40 and UB196608. Five timing cases use N128/G1/BF16 RMS+Z/no bias, `norm_before_gate=False`, eps1e-6. Both subjects pass two numeric seeds (32744904/32744905) before timing at seed32744904.
 
-PR1's seven runs contain24 numeric PASS, four compile-resource negatives and60 timings/30 pairs. Evidence remains native NOT_A_TOOLKIT_RUN/descriptive_only/automated_go=false, with historical M288 NaN cause, matching-main CI/Nightly, model/graph and broader qualification pending. No new PR2 device experiment or code change accompanies this evidence-attribution update.
+| M | Final route/grid | Median BASE64 / final ratio | Six-pair observed range | Run UTC / hex suffix |
+| ---: | --- | ---: | --- | --- |
+| 128 | BASE16 [8,1] | 1.470820x | 1.410170–1.532143x | 2026-10-05T03:54:15Z / 0xafed90c9 |
+| 288 | BASE16 [18,1] | 1.153072x | 1.118541–1.215190x | 2026-10-05T05:53:46Z / 0x30972383 |
+| 289 | HOIST32 [10] | 1.161114x | 1.147147–1.212308x | 2026-10-05T06:25:59Z / 0x0dc60abd |
+| 639 | HOIST32 [20] | 1.059783x | 1.038461–1.080111x | 2026-10-05T06:40:22Z / 0xec136b8d |
+| 20449 | HOIST32 [40] | 1.271823x | 1.256373–1.318982x | 2026-10-05T07:18:37Z / 0x677bd8f4 |
+
+Each row retains three serial ABBA blocks,12 target timings and six individual duration ratios, with a whole-batch shared profiler lock. Timing is raw msprof OpBasicInfo device-task duration,5 warmups/1 launch and a synchronized driver, excluding host comparisons and process wall time. All30 observed pairs favor final PR1 for these points; the result describes the complete tiling/dispatch change, not an isolated hoist contribution or universal non-regression. M288 and M289 test both threshold sides against BASE64 but differ in shape, so they do not establish an optimal same-shape route crossover. M65536 remains separate unchanged-route evidence, not one of the new30 pairs.
+
+M60/N192/G1/BF16 RMS+Z/no bias/eps1e-6 was independently tested with both gate orders: True run `pr1_20261005T015155Z_f174c9c4`, False run `pr1_20261005T023048Z_007e45a3`. Each order uses two fixed seeds. All four upstream BASE64 BM64/BN256/grid[1,1] attempts were explicit compiler UB negatives (2629632 required versus1572864 available bits), numeric NOT_RUN. Same-input final public FT_BASE BM16/BN256/grid[4,1] passed all four numerical checks; separate fresh-process health probes passed after each negative. N192 timing/speedup is N/A. This supports runability for these exact modes, not every device/dtype/width.
+
+Across these seven batches,24 numeric items PASS and four upstream items are compiler resource negatives, not28 numeric PASS. All60 target timings/30 pairs and full saved scientific data were independently reviewed. Output atol/rtol .03/.03 and statistics .005/.005 are elementwise allclose tolerances. M20449's640 BM32 tiles include one valid row in the last tile; all saved valid rows and that tail were checked. Native results are NOT_A_TOOLKIT_RUN, descriptive_only, automated_go=false. Current finite M288 evidence does not resolve the historical first-launch NaN cause. Matching-main CI/Nightly, full model/graph and broader device/dtype qualification remain pending; this documentation refresh changes no code or production gate.
+
+### Wide HOIST resource probe (2026-10-06)
+
+A separately forced experimental HOIST32 route (BM32/BN256/grid40) was tested at N256/G1, M20449 and M2560, BF16 RMS+Z/no bias, norm_before_gate=True, on the same B4/P40/192 KiB UB environment. Each first-seed public BASE16 control passed; each HOIST32 attempt was rejected during compilation: 1713152 bits (209.125 KiB) required versus 1572864 bits (192 KiB) available. Independent tiny NPU health probes passed. Candidate numerics were NOT_RUN, remaining seeds and all timing positions were stopped, and no performance ratios exist.
+
+The experimental override is not part of this PR's public dispatch. The M2560 probe was run without the planned positive-first-point continuation prerequisite and is retained as an additional resource negative. These two failures do not qualify wide-N HOIST or prove all N>128 implementations impossible. PR1 retains FT16 for its qualified intermediate widths; further HOIST tiling work is deferred.
