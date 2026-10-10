@@ -89,12 +89,19 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(m._select_layernorm_launch(2048, 256, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
         self.assertEqual(m._select_layernorm_launch(2048, 384, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
         self.assertEqual(m._select_layernorm_launch(2048, 512, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 16))
-        self.assertEqual(m._select_layernorm_launch(2048, 513, 1, 40, ub_bytes=196608), m.LaunchSpec("FT_BASE", 64))
+        self.assertEqual(
+            m._select_layernorm_launch(65, 513, 1, 40, ub_bytes=196608),
+            m.LaunchSpec("C2_BASE", 64, 64),
+        )
+        self.assertEqual(
+            m._select_layernorm_launch(65, 1024, 2, 40, ub_bytes=196608),
+            m.LaunchSpec("C2_BASE", 64, 64),
+        )
 
     def test_grouped_inputs_keep_base64_across_width_and_resource_branches(self):
         m = self.mod
         for rows in (65, 65536):
-            for width in (63, 127, 128, 129, 192, 512, 513):
+            for width in (63, 127, 128, 129, 192, 512):
                 for groups in (2, 4):
                     for runtime_p, ub_bytes in ((None, None), (40, 196608), (48, 196607)):
                         with self.subTest(rows=rows, width=width, groups=groups, runtime_p=runtime_p):
@@ -124,6 +131,16 @@ class SelectorTests(unittest.TestCase):
             m._select_layernorm_launch(65, 192, 1, 40, ub_bytes=0)
         with self.assertRaisesRegex(m.DispatchConfigError, "runtime_p"):
             m._select_layernorm_launch(65, 128, 1, 0)
+        for ub_bytes in (None, 196607):
+            with (
+                self.subTest(ub_bytes=ub_bytes),
+                self.assertRaisesRegex(m.DispatchConfigError, "no resource-qualified"),
+            ):
+                m._select_layernorm_launch(65, 513, 1, 40, ub_bytes=ub_bytes)
+        self.assertEqual(
+            m._select_layernorm_launch(65, 513, 1, None),
+            m.LaunchSpec("FT_BASE", 64),
+        )
 
 
 if __name__ == "__main__":

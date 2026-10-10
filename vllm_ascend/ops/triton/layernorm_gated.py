@@ -16,6 +16,65 @@ from vllm_ascend.ops.triton.layernorm_gated_dispatch import (
 )
 from vllm_ascend.ops.triton.triton_utils import get_ub_size_bytes, get_vectorcore_num
 
+_C2_SIGNED_I32_MAX = 2**31 - 1
+
+
+def _check_c2_launch_bounds(M, N_total, group_size, ngroups, block_m, block_n_chunk):
+    """Prove the public C2 launch stays inside the lowering's i32 domains.
+
+    The C2 kernel intentionally retains i32 loop/count values.  This guard is
+    host-only and uses the selected launch constants, so every rejection is
+    completed before the grid is constructed or the kernel is indexed.
+    """
+    values = {
+        "M": M,
+        "N_total": N_total,
+        "group_size": group_size,
+        "ngroups": ngroups,
+        "block_m": block_m,
+        "block_n_chunk": block_n_chunk,
+    }
+    if any(type(value) is not int or value <= 0 for value in values.values()):
+        raise RuntimeError("layer_norm_fwd_npu: C2 launch bounds require positive Python ints")
+
+    if M > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 M exceeds signed i32: {M}")
+    if N_total > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 N_total exceeds signed i32: {N_total}")
+    if ngroups > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 ngroups exceeds signed i32: {ngroups}")
+    if block_m > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 BLOCK_M exceeds signed i32: {block_m}")
+    if block_n_chunk > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 BLOCK_N_CHUNK exceeds signed i32: {block_n_chunk}")
+
+    feature_offset_domain = group_size * ngroups
+    if feature_offset_domain > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 feature offset exceeds signed i32: {feature_offset_domain}")
+
+    stats_offset = ngroups * M
+    if stats_offset > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 stats offset exceeds signed i32: {stats_offset}")
+
+    num_m_tiles = (M + block_m - 1) // block_m
+    max_row_index = (num_m_tiles - 1) * block_m + (block_m - 1)
+    if max_row_index > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 row/tile index exceeds signed i32: {max_row_index}")
+
+    max_group_offset = (ngroups - 1) * group_size + (group_size - 1)
+    if max_group_offset > _C2_SIGNED_I32_MAX:
+        raise RuntimeError(f"layer_norm_fwd_npu: C2 group feature offset exceeds signed i32: {max_group_offset}")
+
+    if group_size > _C2_SIGNED_I32_MAX - (block_n_chunk - 1):
+        raise RuntimeError("layer_norm_fwd_npu: C2 group_size exceeds the i32 chunk/count bound")
+    last_chunk_start = ((group_size - 1) // block_n_chunk) * block_n_chunk
+    final_chunk_update = last_chunk_start + block_n_chunk
+    if final_chunk_update > _C2_SIGNED_I32_MAX:
+        raise RuntimeError("layer_norm_fwd_npu: C2 chunk-loop update exceeds signed i32")
+    count_upper_bound = group_size
+    if count_upper_bound > _C2_SIGNED_I32_MAX:
+        raise RuntimeError("layer_norm_fwd_npu: C2 count exceeds signed i32")
+
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
@@ -184,6 +243,126 @@ def _layer_norm_fwd_persistent_hoist_kernel_npu(
         tl.store(y_ptrs, y, mask=row_mask[:, None] & col_mask[None, :])
 
 
+@triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
+@triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
+@triton.jit(
+    do_not_specialize=[
+        "stride_x_row",
+        "stride_y_row",
+        "stride_z_row",
+        "M",
+        "N",
+        "eps",
+    ]
+)
+def _layer_norm_fwd_c2_nchunk_kernel_npu(
+    X,
+    Y,
+    W,
+    B,
+    Z,
+    Mean,
+    Rstd,
+    stride_x_row,
+    stride_y_row,
+    stride_z_row,
+    M,
+    N,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N_CHUNK: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
+):
+    # Non-persistent two-pass N-chunk kernel.  Each program owns one (M tile,
+    # normalization group): it scans the complete group in finite N chunks to
+    # form statistics, then reloads X chunks to normalize, affine, gate, and
+    # store.  N is a runtime loop bound; only BLOCK_M / BLOCK_N_CHUNK are
+    # constexpr.  Stats are group-major; RMS has no Mean allocation.
+    pid_m = tl.program_id(0)
+    group = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    lane_cols = tl.arange(0, BLOCK_N_CHUNK)
+    row_mask = rows < M
+    group_offset = group * N
+
+    mean_ptr = Mean
+    rstd_ptr = Rstd + group * M
+    if not IS_RMS_NORM:
+        mean_ptr = Mean + group * M
+
+    # Pass 1: scan all chunks in ascending order.  RMS retains the FP32 sumsq
+    # path; LN performs the frozen left-to-right Welford merge.
+    sumsq = tl.zeros((BLOCK_M,), tl.float32)
+    acc_count = tl.zeros((), dtype=tl.int32)
+    acc_mean = tl.zeros((BLOCK_M,), tl.float32)
+    acc_m2 = tl.zeros((BLOCK_M,), tl.float32)
+    for chunk_start in tl.range(0, N, BLOCK_N_CHUNK):
+        cols = chunk_start + lane_cols
+        col_mask = cols < N
+        mask = row_mask[:, None] & col_mask[None, :]
+        x_ptrs = X + rows[:, None] * stride_x_row + group_offset + cols[None, :]
+        x_chunk = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        if HAS_Z and not NORM_BEFORE_GATE:
+            z_ptrs = Z + rows[:, None] * stride_z_row + group_offset + cols[None, :]
+            z_chunk = tl.load(z_ptrs, mask=mask, other=0.0).to(tl.float32)
+            x_chunk *= z_chunk * tl.sigmoid(z_chunk)
+
+        valid_count = tl.minimum(N - chunk_start, BLOCK_N_CHUNK)
+        if IS_RMS_NORM:
+            sumsq += tl.sum(tl.where(col_mask[None, :], x_chunk * x_chunk, 0.0), axis=1)
+        else:
+            valid_count_f = valid_count.to(tl.float32)
+            chunk_mean = tl.sum(tl.where(col_mask[None, :], x_chunk, 0.0), axis=1) / valid_count_f
+            centered = tl.where(col_mask[None, :], x_chunk - chunk_mean[:, None], 0.0)
+            chunk_m2 = tl.sum(centered * centered, axis=1)
+            total_count = acc_count + valid_count
+            total_count_f = total_count.to(tl.float32)
+            delta = chunk_mean - acc_mean
+            acc_m2 += chunk_m2 + delta * delta * (acc_count.to(tl.float32) * valid_count_f / total_count_f)
+            acc_mean += delta * (valid_count_f / total_count_f)
+            acc_count = total_count
+
+    if IS_RMS_NORM:
+        rstd = 1.0 / tl.sqrt(sumsq / N + eps)
+    else:
+        mean = acc_mean
+        rstd = 1.0 / tl.sqrt(acc_m2 / acc_count.to(tl.float32) + eps)
+        tl.store(mean_ptr + rows, mean, mask=row_mask)
+    tl.store(rstd_ptr + rows, rstd, mask=row_mask)
+
+    # Pass 2: reload X; W/B stream per N chunk.  Ordering is after the complete
+    # Pass-1 scan so an independent out is safe.
+    for chunk_start in tl.range(0, N, BLOCK_N_CHUNK):
+        cols = chunk_start + lane_cols
+        col_mask = cols < N
+        mask = row_mask[:, None] & col_mask[None, :]
+        x_ptrs = X + rows[:, None] * stride_x_row + group_offset + cols[None, :]
+        x_chunk = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        z_chunk = None
+        if HAS_Z:
+            z_ptrs = Z + rows[:, None] * stride_z_row + group_offset + cols[None, :]
+            z_chunk = tl.load(z_ptrs, mask=mask, other=0.0).to(tl.float32)
+            if not NORM_BEFORE_GATE:
+                x_chunk *= z_chunk * tl.sigmoid(z_chunk)
+
+        w_chunk = tl.load(W + group_offset + cols, mask=col_mask, other=0.0).to(tl.float32)
+        if IS_RMS_NORM:
+            y = x_chunk * rstd[:, None]
+        else:
+            y = (x_chunk - mean[:, None]) * rstd[:, None]
+        y *= w_chunk[None, :]
+        if HAS_BIAS:
+            b_chunk = tl.load(B + group_offset + cols, mask=col_mask, other=0.0).to(tl.float32)
+            y += b_chunk[None, :]
+        if HAS_Z and NORM_BEFORE_GATE:
+            y *= z_chunk * tl.sigmoid(z_chunk)
+        y_ptrs = Y + rows[:, None] * stride_y_row + group_offset + cols[None, :]
+        tl.store(y_ptrs, y, mask=mask)
+
+
 def layer_norm_fwd_npu(
     x,
     weight,
@@ -221,9 +400,9 @@ def layer_norm_fwd_npu(
 
     runtime_p = None
     ub_bytes = None
-    if ngroups == 1 and getattr(getattr(x, "device", None), "type", None) == "npu":
+    if (ngroups == 1 or group_size > BASE16_MAX_N_GROUP) and getattr(getattr(x, "device", None), "type", None) == "npu":
         runtime_p = get_vectorcore_num()
-        if 128 < group_size <= BASE16_MAX_N_GROUP:
+        if group_size > 128:
             ub_bytes = get_ub_size_bytes()
     spec = _select_layernorm_launch(
         M,
@@ -234,8 +413,9 @@ def layer_norm_fwd_npu(
     )
 
     # BASE selections reuse the upstream kernel and feature-dimension guard.
-    # Grouped, non-NPU, and unqualified wide-N inputs retain BLOCK_M=64;
-    # qualified single-group NPU inputs may use a smaller row tile.
+    # Grouped inputs through N_group=512 and non-NPU inputs retain BASE64.
+    # Wider NPU inputs use C2 only when the existing initialized UB getter
+    # reports its qualified minimum.
     if spec.impl == "FT_BASE":
         max_fused_size = 65536 // x.element_size()
         block_n = min(max_fused_size, triton.next_power_of_2(group_size))
@@ -265,6 +445,36 @@ def layer_norm_fwd_npu(
         )
         return out, mean, rstd
 
+    if spec.impl == "C2_BASE":
+        if spec.block_n_chunk is None:
+            raise DispatchConfigError("C2_BASE spec missing block_n_chunk")
+        _check_c2_launch_bounds(M, N, group_size, ngroups, spec.block_m, spec.block_n_chunk)
+        grid = (triton.cdiv(M, spec.block_m), ngroups)
+        _layer_norm_fwd_c2_nchunk_kernel_npu[grid](
+            x,
+            out,
+            weight,
+            bias,
+            z,
+            mean,
+            rstd,
+            x.stride(0),
+            out.stride(0),
+            z.stride(0) if z is not None else 0,
+            M,
+            group_size,
+            eps,
+            BLOCK_M=spec.block_m,
+            BLOCK_N_CHUNK=spec.block_n_chunk,
+            HAS_BIAS=bias is not None,
+            HAS_Z=z is not None,
+            NORM_BEFORE_GATE=norm_before_gate,
+            IS_RMS_NORM=is_rms_norm,
+        )
+        return out, mean, rstd
+
+    if runtime_p is None:
+        raise DispatchConfigError("persistent selection requires an initialized vector-core count")
     block_n = min(65536 // x.element_size(), triton.next_power_of_2(group_size))
 
     if spec.impl == "FT_PERSIST_HOIST":

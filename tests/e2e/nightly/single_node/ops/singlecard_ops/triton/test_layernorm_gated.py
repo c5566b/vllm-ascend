@@ -4,7 +4,11 @@ import torch.nn.functional as F
 
 import vllm_ascend.ops.triton.layernorm_gated as layernorm_gated
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+from vllm_ascend.ops.triton.triton_utils import (
+    get_ub_size_bytes,
+    get_vectorcore_num,
+    init_device_properties_triton,
+)
 
 DEVICE = "npu"
 TOLERANCES = {
@@ -262,6 +266,95 @@ def test_layer_norm_fwd_npu_hoist_routes(
     if is_rms_norm:
         assert actual_mean is None
         assert expected_mean is None
+    else:
+        torch.testing.assert_close(actual_mean.cpu(), expected_mean, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("group_size", "ngroups", "dtype", "has_bias", "has_gate", "is_rms_norm", "norm_before_gate", "seed"),
+    [
+        pytest.param(
+            513,
+            1,
+            torch.bfloat16,
+            False,
+            True,
+            True,
+            True,
+            32744904,
+            id="c2-n513-bf16-rmsnorm-post-gate",
+        ),
+        pytest.param(
+            1024,
+            1,
+            torch.float16,
+            False,
+            True,
+            True,
+            False,
+            32744905,
+            id="c2-n1024-fp16-rmsnorm-pre-gate",
+        ),
+        pytest.param(
+            513,
+            2,
+            torch.bfloat16,
+            True,
+            True,
+            False,
+            False,
+            32744904,
+            id="c2-n513-g2-bf16-layernorm-bias-gate",
+        ),
+    ],
+)
+@torch.inference_mode()
+def test_layer_norm_fwd_npu_c2_public_route(
+    group_size,
+    ngroups,
+    dtype,
+    has_bias,
+    has_gate,
+    is_rms_norm,
+    norm_before_gate,
+    seed,
+    monkeypatch,
+):
+    if get_ub_size_bytes() < 196608:
+        pytest.skip("C2 BM64/BNc64 needs a 192 KiB UB budget")
+
+    rows = 65
+    total_n = group_size * ngroups
+    shape = (rows, total_n)
+    original_kernel = layernorm_gated._layer_norm_fwd_c2_nchunk_kernel_npu
+    recorder = _KernelLaunchRecorder(original_kernel)
+    monkeypatch.setattr(layernorm_gated, "_layer_norm_fwd_c2_nchunk_kernel_npu", recorder)
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    x = torch.randn(shape, generator=generator, dtype=dtype).to(DEVICE)
+    weight = torch.randn((total_n,), generator=generator, dtype=dtype).to(DEVICE)
+    bias = torch.randn((total_n,), generator=generator, dtype=dtype).to(DEVICE) if has_bias else None
+    z = torch.randn(shape, generator=generator, dtype=dtype).to(DEVICE) if has_gate else None
+    actual, actual_mean, actual_rstd = layer_norm_fwd_npu(
+        x,
+        weight,
+        bias,
+        1e-6,
+        z=z,
+        group_size=group_size,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=is_rms_norm,
+    )
+    expected, expected_mean, expected_rstd = layer_norm_gated_ref(
+        x, weight, bias, 1e-6, z, group_size, norm_before_gate, is_rms_norm
+    )
+
+    assert recorder.grids == [((rows + 63) // 64, ngroups)]
+    rtol, atol = TOLERANCES[dtype]
+    torch.testing.assert_close(actual.float().cpu(), expected.float(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_rstd.cpu(), expected_rstd, rtol=rtol, atol=atol)
+    if is_rms_norm:
+        assert actual_mean is None
     else:
         torch.testing.assert_close(actual_mean.cpu(), expected_mean, rtol=rtol, atol=atol)
 

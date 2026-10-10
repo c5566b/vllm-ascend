@@ -10,7 +10,8 @@
 - **Algorithm flow** (rows and groups are independent):
   1. Validate the two-dimensional input layout, allocate output/statistics, and select a BASE row tile or HOIST32 execution.
   2. BASE processes BM16 or BM64 row tiles. HOIST32 uses BM32 tiles in a grid-stride loop with the grid capped at the vector-core count; weight and optional bias are loaded before the loop.
-  3. Normalize and apply the affine transform and optional gate in fp32, then store masked outputs and group-major statistics.
+  3. For `N_group>512`, C2 scans feature chunks for statistics, then again for normalization, affine, and optional gate, using BM64 and 64-column chunks.
+  4. Normalize and apply the affine transform and optional gate in fp32, then store masked outputs and group-major statistics.
 - **Supported modes**: Ascend NPU inference with LayerNorm or RMSNorm, optional bias, and pre/post gate. Device validation recorded for this change is limited to Ascend910B4.
 
 ## Parameters
@@ -33,9 +34,9 @@
 - `M` and `N_group` must be positive, and `N` divisible by `group_size`. `weight` and optional `bias` have shape `[N]`; optional `z` and `out` match `x`. All require contiguous last dimensions.
 - `G=N/N_group` counts normalization groups within each row. For GDN output normalization, `[T,H_local,D_v]` is flattened to `[M,N]` with `M=T*H_local` and `N=D_v`: each row is one token/value-head pair, and model heads do not become normalization groups. `group_size=None` gives `G=1`.
 - Statistics use group-major indexing `group*M+row`. Caller-provided `out` is reused.
-- Multi-group inputs retain BASE64. Single-group NPU inputs below width 128 use BASE16; width 128 uses HOIST32 when `4*ceil(M/32)>=P`, otherwise BASE16, where `P` is the initialized vector-core count. Widths 129–512 use BASE16 when the UB getter reports at least 192 KiB; other inputs retain BASE64.
-- Single-group NPU calls require device properties initialized through the existing `init_device_properties_triton()` contract. The UB getter may use its existing compatibility default or debugging override. Grouped calls do not query these properties.
-- The single-group BASE16 resource envelope ends at `N_group=512` (`BLOCK_N<=512`). Wider groups retain BASE64 and may still overflow UB; this change does not make them resource-safe. The limit applies to per-group width, not total `N`. BASE's existing `65536 / element_size` feature-width guard is separate from the compiler's full-tile UB limit.
+- Multi-group inputs through `N_group=512` retain BASE64. Single-group NPU inputs below width 128 use BASE16; width 128 uses HOIST32 when `4*ceil(M/32)>=P`, otherwise BASE16, where `P` is the initialized vector-core count. Single-group widths 129–512 use BASE16 when the UB getter reports at least 192 KiB; unqualified full-tile inputs retain BASE64.
+- Single-group NPU calls and C2 calls require device properties initialized through the existing `init_device_properties_triton()` contract. The UB getter may use its existing compatibility default or debugging override. Grouped calls through `N_group=512` do not query these properties.
+- The single-group BASE16 resource envelope ends at `N_group=512` (`BLOCK_N<=512`). Wider NPU groups use C2 for any group count when the initialized UB getter reports at least 192 KiB; unknown or lower UB rejects before launch. Signed-i32 row, group, and chunk-loop bounds are checked before C2 launch. Non-NPU inputs retain BASE64. The limit applies to per-group width, not total `N`. BASE's existing `65536 / element_size` feature-width guard is separate from the compiler's full-tile UB limit.
 - Forward inference only. Graph replay and full-model qualification are not established by the recorded single-operator tests.
 
 ## Origin and Differences
@@ -43,11 +44,12 @@
 - **Origin**: The existing vLLM-Ascend gated normalization implementation is adapted from Flash Linear Attention's gated LayerNorm and the Triton LayerNorm tutorial; see the source-file header.
 - **Differences**:
     - NPU adaptation for performance: selects smaller BASE row tiles for eligible single-group inputs and uses persistent execution with parameter reuse for suitable N128 workloads.
-    - Public API, normalization/gating semantics, output aliasing, and statistics layout are unchanged. Grouped inputs keep the original BASE64 launch.
+    - Public API, normalization/gating semantics, output aliasing, and statistics layout are unchanged. Grouped inputs through `N_group=512` keep the original BASE64 launch.
+    - C2 reduces the live feature tile for wider groups while preserving the public normalization and gating contract. This resource-qualified path does not carry a performance claim.
 
 ## Test Cases
 
-The single-card accuracy test compares outputs and statistics against an fp32 CPU reference, covering LayerNorm/RMSNorm, optional bias/gate, grouping, caller-provided `out`, dispatch boundaries, and a large N128 shape. Dtype-specific tolerances are `rtol=2e-3, atol=2e-2` for fp16; `rtol=2e-2, atol=5e-2` for bf16; and `rtol=atol=1e-4` for fp32. Matching-main in-tree NPU execution remains pending.
+The single-card accuracy test compares outputs and statistics against an fp32 CPU reference, covering LayerNorm/RMSNorm, optional bias/gate, grouping, caller-provided `out`, dispatch boundaries, and a large N128 shape. Dtype-specific tolerances are `rtol=2e-3, atol=2e-2` for fp16; `rtol=2e-2, atol=5e-2` for bf16; and `rtol=atol=1e-4` for fp32. C2 cases additionally cover N513 BF16 RMSNorm with post-gate, N1024 FP16 RMSNorm with pre-gate, and grouped N513 BF16 LayerNorm with bias and gate. Matching-main in-tree NPU execution remains pending.
 
 ```bash
 pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_layernorm_gated.py

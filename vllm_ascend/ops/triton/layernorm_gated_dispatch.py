@@ -1,9 +1,8 @@
-"""Pure-scalar PR1 launch selection for the gated LayerNorm kernel.
+"""Pure-scalar launch selection for the gated LayerNorm kernels.
 
 The selector deliberately knows nothing about torch, devices, or resource
-queries. The wrapper supplies the initialized vector-core count for
-single-group NPU tensors and None otherwise. Wide BASE16 selection also
-receives the optional UB value from the initialized-properties getter.
+queries. The wrapper supplies initialized vector-core properties for
+single-group NPU inputs and wide C2 inputs. Other calls retain BASE64.
 """
 
 from __future__ import annotations
@@ -12,8 +11,13 @@ from typing import Literal, NamedTuple
 
 
 class LaunchSpec(NamedTuple):
-    impl: Literal["FT_BASE", "FT_PERSIST_HOIST"]
+    impl: Literal["FT_BASE", "FT_PERSIST_HOIST", "C2_BASE"]
     block_m: int
+    block_n_chunk: int | None = None
+
+
+class DispatchConfigError(ValueError):
+    """Raised when a selector input is invalid or no qualified route exists."""
 
 
 BM_BASE16 = 16
@@ -21,10 +25,9 @@ BM_HOIST = 32
 HOIST_QUARTER_WAVE_DIVISOR = 4
 BASE16_MAX_N_GROUP = 512
 BASE16_MIN_UB_BYTES = 196_608
-
-
-class DispatchConfigError(ValueError):
-    """Raised when a selector input is invalid."""
+BM_C2 = 64
+BN_C2_CHUNK = 64
+C2_MIN_UB_BYTES = 196_608
 
 
 def _is_positive_exact_int(value) -> bool:
@@ -49,22 +52,29 @@ def _select_layernorm_launch(
     *,
     ub_bytes: int | None = None,
 ) -> LaunchSpec:
-    """Select the qualified PR1 path, or retain the upstream BASE64 fallback.
+    """Select the fixed PR1 policy, adding C2 only for qualified wide N.
 
-    Multiple groups or a missing runtime_p select the upstream BASE64 launch.
-    Single-group NPU callers obtain the count through the existing
-    initialized-device-properties contract.
-    Wide BASE16 selection additionally requires a known UB value at or above
-    the minimum qualified resource budget.
+    Missing vector-core properties retain the upstream BASE64 launch. For
+    ``N_group > 512``, C2 requires a known 192 KiB UB budget and otherwise
+    fails closed before launch.
     """
     _validate_inputs(M, N_group, ngroups, runtime_p, ub_bytes)
-    if ngroups > 1 or runtime_p is None:
+    if runtime_p is None:
         return LaunchSpec("FT_BASE", 64)
 
-    # For wide groups, BASE16 is qualified only for the tested BN256/512
-    # envelope. The wrapper supplies UB from the existing properties getter.
+    if N_group > BASE16_MAX_N_GROUP:
+        if ub_bytes is None or ub_bytes < C2_MIN_UB_BYTES:
+            raise DispatchConfigError("no resource-qualified LayerNorm-Gated path")
+        return LaunchSpec("C2_BASE", BM_C2, BN_C2_CHUNK)
+
+    # Grouped full-tile inputs retain the upstream PR1 launch. Wide C2
+    # selection above applies to both single-group and grouped inputs.
+    if ngroups > 1:
+        return LaunchSpec("FT_BASE", 64)
+
+    # This branch is exactly the qualified PR1 BASE16 envelope.
     if N_group > 128:
-        if N_group <= BASE16_MAX_N_GROUP and ub_bytes is not None and ub_bytes >= BASE16_MIN_UB_BYTES:
+        if ub_bytes is not None and ub_bytes >= BASE16_MIN_UB_BYTES:
             return LaunchSpec("FT_BASE", BM_BASE16)
         return LaunchSpec("FT_BASE", 64)
 

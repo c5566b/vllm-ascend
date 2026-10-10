@@ -14,15 +14,14 @@ DISPATCH = ROOT / "vllm_ascend" / "ops" / "triton" / "layernorm_gated_dispatch.p
 
 
 class RouteSourceTests(unittest.TestCase):
-    def test_sources_parse_and_exclude_wide_path_symbols(self):
+    def test_sources_parse_and_include_bounded_c2_path(self):
         layer_source = LAYER_NORM.read_text()
         dispatch_source = DISPATCH.read_text()
         ast.parse(layer_source)
         ast.parse(dispatch_source)
-        self.assertNotIn("c2_", layer_source.lower())
-        self.assertNotIn("c2_", dispatch_source.lower())
-        self.assertNotIn("compile_target", layer_source.lower())
-        self.assertNotIn("try_get_compile_target", layer_source)
+        self.assertIn("_layer_norm_fwd_c2_nchunk_kernel_npu", layer_source)
+        self.assertIn("_check_c2_launch_bounds", layer_source)
+        self.assertIn("no resource-qualified LayerNorm-Gated path", dispatch_source)
 
     def test_device_name_and_dtype_allowlists_are_absent(self):
         source = LAYER_NORM.read_text()
@@ -204,7 +203,7 @@ class WrapperRouteTests(unittest.TestCase):
         state["ub_size"] = None
         try:
             for rows, groups in ((65, 2), (65536, 4)):
-                for width in (63, 128, 192, 512, 513):
+                for width in (63, 128, 192, 512):
                     for rms, gate_before in ((False, False), (True, True)):
                         with self.subTest(rows=rows, groups=groups, width=width, rms=rms):
                             columns = width * groups
@@ -427,12 +426,32 @@ class WrapperRouteTests(unittest.TestCase):
 
             state["ub_size"] = 196608
             before_ub_calls = state["ub_getter_calls"]
-            call(65, columns=513)
-            self.assertEqual(launches[-1][1], (2, 1))
-            self.assertEqual(launches[-1][3]["BLOCK_M"], 64)
-            self.assertEqual(launches[-1][3]["BLOCK_N"], 1024)
-            self.assertEqual(state["ub_getter_calls"], before_ub_calls)
+            call(65, columns=513, bias=False, z=True, is_rms_norm=True)
+            name, grid, args, kwargs = launches[-1]
+            self.assertEqual(name, "_layer_norm_fwd_c2_nchunk_kernel_npu")
+            self.assertEqual(grid, (2, 1))
+            self.assertEqual((kwargs["BLOCK_M"], kwargs["BLOCK_N_CHUNK"]), (64, 64))
+            self.assertEqual((kwargs["HAS_BIAS"], kwargs["HAS_Z"]), (False, True))
+            self.assertIsNone(args[3])
+            self.assertEqual(state["ub_getter_calls"], before_ub_calls + 1)
 
+            call(65, columns=1026, group_size=513)
+            self.assertEqual(launches[-1][1], (2, 2))
+            self.assertEqual(launches[-1][3]["BLOCK_N_CHUNK"], 64)
+
+            before_launches = len(launches)
+            for ub_size in (None, 131072):
+                state["ub_size"] = ub_size
+                with self.subTest(ub_size=ub_size), self.assertRaisesRegex(ValueError, "no resource-qualified"):
+                    call(65, columns=513)
+                self.assertEqual(len(launches), before_launches)
+            state["ub_size"] = 196608
+
+            with self.assertRaisesRegex(RuntimeError, "C2 M exceeds signed i32"):
+                call(2**31, columns=513)
+            self.assertEqual(len(launches), before_launches)
+
+            before_ub_calls = state["ub_getter_calls"]
             state["vector_cores"] = None
             with self.assertRaisesRegex(AssertionError, "Device properties not initialized"):
                 call(65, columns=256)
