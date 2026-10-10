@@ -10,6 +10,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.layernorm_gated_dispatch import (
+    BASE16_MAX_N_GROUP,
     DispatchConfigError,
     _select_layernorm_launch,
 )
@@ -399,7 +400,7 @@ def layer_norm_fwd_npu(
 
     runtime_p = None
     ub_bytes = None
-    if getattr(getattr(x, "device", None), "type", None) == "npu":
+    if (ngroups == 1 or group_size > BASE16_MAX_N_GROUP) and getattr(getattr(x, "device", None), "type", None) == "npu":
         runtime_p = get_vectorcore_num()
         if group_size > 128:
             ub_bytes = get_ub_size_bytes()
@@ -412,8 +413,9 @@ def layer_norm_fwd_npu(
     )
 
     # BASE selections reuse the upstream kernel and feature-dimension guard.
-    # Non-NPU inputs retain BASE64. N>512 NPU inputs use C2 only when the
-    # existing initialized UB getter reports its qualified minimum.
+    # Grouped inputs through N_group=512 and non-NPU inputs retain BASE64.
+    # Wider NPU inputs use C2 only when the existing initialized UB getter
+    # reports its qualified minimum.
     if spec.impl == "FT_BASE":
         max_fused_size = 65536 // x.element_size()
         block_n = min(max_fused_size, triton.next_power_of_2(group_size))

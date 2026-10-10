@@ -1,8 +1,8 @@
 """Pure-scalar launch selection for the gated LayerNorm kernels.
 
 The selector deliberately knows nothing about torch, devices, or resource
-queries. The wrapper supplies the initialized vector-core count on NPU and
-None for non-NPU tensors. Wide-N routes use the initialized UB size.
+queries. The wrapper supplies initialized vector-core properties for
+single-group NPU inputs and wide C2 inputs. Other calls retain BASE64.
 """
 
 from __future__ import annotations
@@ -20,13 +20,11 @@ class DispatchConfigError(ValueError):
     """Raised when a selector input is invalid or no qualified route exists."""
 
 
-BM_SMALL = 16
-BM_MULTI = 32
+BM_BASE16 = 16
 BM_HOIST = 32
 HOIST_QUARTER_WAVE_DIVISOR = 4
-BM_FT16 = 16
-FT16_MAX_N_GROUP = 512
-FT16_MIN_UB_BYTES = 196_608
+BASE16_MAX_N_GROUP = 512
+BASE16_MIN_UB_BYTES = 196_608
 BM_C2 = 64
 BN_C2_CHUNK = 64
 C2_MIN_UB_BYTES = 196_608
@@ -64,25 +62,26 @@ def _select_layernorm_launch(
     if runtime_p is None:
         return LaunchSpec("FT_BASE", 64)
 
-    if N_group > FT16_MAX_N_GROUP:
+    if N_group > BASE16_MAX_N_GROUP:
         if ub_bytes is None or ub_bytes < C2_MIN_UB_BYTES:
             raise DispatchConfigError("no resource-qualified LayerNorm-Gated path")
         return LaunchSpec("C2_BASE", BM_C2, BN_C2_CHUNK)
 
-    # This branch is exactly the qualified PR1 FT16 envelope.
+    # Grouped full-tile inputs retain the upstream PR1 launch. Wide C2
+    # selection above applies to both single-group and grouped inputs.
+    if ngroups > 1:
+        return LaunchSpec("FT_BASE", 64)
+
+    # This branch is exactly the qualified PR1 BASE16 envelope.
     if N_group > 128:
-        if ub_bytes is not None and ub_bytes >= FT16_MIN_UB_BYTES:
-            return LaunchSpec("FT_BASE", BM_FT16)
+        if ub_bytes is not None and ub_bytes >= BASE16_MIN_UB_BYTES:
+            return LaunchSpec("FT_BASE", BM_BASE16)
         return LaunchSpec("FT_BASE", 64)
 
     if N_group < 128:
-        return LaunchSpec("FT_BASE", BM_SMALL)
-
-    # Keep grouped N=128 execution on the qualified non-persistent BASE32 path.
-    if ngroups > 1:
-        return LaunchSpec("FT_BASE", BM_MULTI)
+        return LaunchSpec("FT_BASE", BM_BASE16)
 
     hoist_tiles = (M + BM_HOIST - 1) // BM_HOIST
     if HOIST_QUARTER_WAVE_DIVISOR * hoist_tiles >= runtime_p:
         return LaunchSpec("FT_PERSIST_HOIST", BM_HOIST)
-    return LaunchSpec("FT_BASE", BM_SMALL)
+    return LaunchSpec("FT_BASE", BM_BASE16)
